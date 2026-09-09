@@ -1,0 +1,11 @@
+{
+    "_comment": "Where nap-xtz-server lives. The ports are its PORT_WS and PORT_HTTP.",
+    "server_host": "localhost",
+    "server_ws_port": 4321,
+    "server_http_port": 8080,
+
+    "slideshow_interval": 10,
+
+    "_slideshow_to_rpi": "The browser client mirrors slideshow frames to the Pi. If this app IS that Pi, turning this on would feed drawings back to itself.",
+    "slideshow_to_rpi": false
+}
