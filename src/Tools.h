@@ -2,6 +2,7 @@
 
 #include "ofMain.h"
 
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -57,18 +58,55 @@ class Stroke {
         /// The ribbon, as a drawable triangle mesh.
         const ofVboMesh & getBrushMesh();
 
-        /// The same ribbon as a closed outline -- left edge forward, then right
-        /// edge reversed. This is what gets projected and encoded to NAPLPS,
-        /// which has no notion of line thickness and so needs a filled polygon.
-        std::vector<glm::vec3> toBrushOutline() const;
+        /// How far simplification may move a point of the exported centreline,
+        /// in frame widths -- 1 is the whole drawing, so this is about a pixel
+        /// of a 640-wide one.
+        static constexpr float kBrushSimplify = 0.002f;
+
+        /// Carries a point of this stroke into the flat 0..1 space the NAPLPS
+        /// encoder works in. DrawingMode owns it, being the only thing that
+        /// knows the camera and what the two-handed grab has left on the world.
+        using ProjectFn = std::function<glm::vec2(const glm::vec3 &)>;
+
+        /// A centreline and its brush radii, both in that flat space.
+        struct ScreenPath {
+            std::vector<glm::vec2> points;
+            std::vector<float> radii;
+        };
+
+        /// Brush radius at one point: tapered along the stroke and scaled by
+        /// pressure, with both tips pinched so it doesn't start with a flare.
+        float radiusAt(size_t i) const;
+
+        /// Projects the stroke, measuring the brush width in the projection
+        /// rather than in its own plane: a point offset along widthAxis is
+        /// projected beside each centre point, so the width follows perspective
+        /// and survives however the stroke was drawn -- including one drawn
+        /// straight at the camera, which has no width in its own plane at all.
+        ScreenPath toScreenPath(const ProjectFn & project, const glm::vec3 & widthAxis) const;
+
+        /// The stroke as a run of short filled polygons -- one quad per segment
+        /// of the simplified centreline -- which is the shape NAPLPS wants.
+        ///
+        /// A quad built on one segment's own perpendicular is convex, so every
+        /// renderer fills it alike whichever winding rule it uses, where a single
+        /// long outline of the whole stroke crosses itself at every tight turn
+        /// and fills differently on each. Four points is also short enough that
+        /// the encoder's running delta cursor is reset before its rounding error
+        /// can accumulate into visible drift. Consecutive quads reach a little
+        /// way into each other so no gap shows at a turn.
+        std::vector<std::vector<glm::vec2>> toBrushQuads(const ProjectFn & project,
+                                                         const glm::vec3 & widthAxis,
+                                                         float epsilon = kBrushSimplify) const;
 
         /// Invalidates the cached mesh. Needed after anything that moves points.
         void setDirty() { meshDirty = true; }
 
     private:
 
-        /// Shared by getBrushMesh() and toBrushOutline(): walks the centreline
-        /// and offsets each point perpendicular to it by the local radius.
+        /// Walks the centreline and offsets each point perpendicular to it by
+        /// the local radius. The drawable mesh is built from this; what gets
+        /// encoded is not -- see toBrushQuads().
         void buildEdges(std::vector<glm::vec3> & leftEdge,
                         std::vector<glm::vec3> & rightEdge) const;
 

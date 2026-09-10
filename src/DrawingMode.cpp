@@ -1005,8 +1005,9 @@ glm::vec3 DrawingMode::worldToNdc(const glm::vec3 & world) const {
 
 //--------------------------------------------------------------
 // Flattens the 3D drawing to the NAPLPS unit screen, from exactly the viewpoint
-// the user last had. NAPLPS has no line thickness, so each stroke is encoded as
-// its filled brush outline rather than its centreline.
+// the user last had. NAPLPS has no line thickness, so a stroke is encoded as a
+// run of short filled polygons -- see Stroke::toBrushQuads(), which owns the
+// shape of them; this owns the viewpoint they are flattened from.
 void DrawingMode::convertToNaplps() {
     encodedNaplps.clear();
 
@@ -1016,43 +1017,40 @@ void DrawingMode::convertToNaplps() {
         return;
     }
 
+    // Stroke points live in the frame's space, and the frame rides on the world
+    // node a two-handed grab moves, so a point goes through that transform
+    // before the camera sees it -- otherwise a drawing that was zoomed or turned
+    // encodes in the pose it was drawn in rather than the one on screen.
+    const Stroke::ProjectFn project = [this](const glm::vec3 & localPoint) {
+        const glm::vec3 ndc = worldToNdc(NapDraw::localToWorld(frame, localPoint));
+
+        const float nx = (ndc.x + 1.0f) * 0.5f;
+
+        // The main canvas draws NAPLPS into a square 640x640 space, so this
+        // 4:3 view has to be squeezed vertically by 480/640 and pushed down
+        // by the remainder -- the same convention the SVG importer uses
+        // (y/sH*0.75 + 0.25). Without it the drawing comes out stretched.
+        const float vScale = 1.0f / kDrawAspect; // 0.75
+        const float ny = ((1.0f - ndc.y) * 0.5f) * vScale + (1.0f - vScale);
+
+        return glm::vec2(nx, ny);
+    };
+
+    // Brush width is measured across the view, so it never depends on which way
+    // the stroke happens to face. The camera's right vector, carried back into
+    // the frame's space, is that direction where the stroke's points live.
+    const glm::mat3 toStrokeSpace = glm::inverse(glm::mat3(frame.getGlobalTransformMatrix()));
+    const glm::vec3 widthAxis = glm::normalize(toStrokeSpace * camera.getXAxis());
+
     std::vector<NapInputWrapper> input;
 
     for (const Stroke & stroke : strokes) {
         if (stroke.points.size() < 2) continue;
 
-        const std::vector<glm::vec3> outline3D = stroke.toBrushOutline();
-        if (outline3D.size() < 3) continue;
-
-        std::vector<glm::vec2> points2D;
-        points2D.reserve(outline3D.size());
-
-        for (const glm::vec3 & localPoint : outline3D) {
-            // Stroke points live in the frame's space; the world node's
-            // transform is what a two-handed grab has been changing.
-            const glm::vec3 world = NapDraw::localToWorld(frame, localPoint);
-            const glm::vec3 ndc = worldToNdc(world);
-
-            const float nx = (ndc.x + 1.0f) * 0.5f;
-
-            // The main canvas draws NAPLPS into a square 640x640 space, so this
-            // 4:3 view has to be squeezed vertically by 480/640 and pushed down
-            // by the remainder -- the same convention the SVG importer uses
-            // (y/sH*0.75 + 0.25). Without it the drawing comes out stretched.
-            const float vScale = 1.0f / kDrawAspect; // 0.75
-            const float ny = ((1.0f - ndc.y) * 0.5f) * vScale + (1.0f - vScale);
-
-            points2D.push_back(glm::vec2(
-                ofClamp(nx, 0.0f, 1.0f),
-                ofClamp(ny, 0.0f, 1.0f)));
+        // One short filled polygon per segment of the stroke
+        for (const std::vector<glm::vec2> & quad : stroke.toBrushQuads(project, widthAxis)) {
+            input.push_back(NapInputWrapper(stroke.color, quad, true /* filled */));
         }
-
-        // One point per frame of drawing is far more than the format needs, and
-        // a token is capped at ~30 KB.
-        points2D = NapDraw::rdpSimplify(points2D, 0.002f);
-        if (points2D.size() < 3) continue;
-
-        input.push_back(NapInputWrapper(stroke.color, points2D, true /* filled */));
     }
 
     if (input.empty()) {
@@ -1063,6 +1061,7 @@ void DrawingMode::convertToNaplps() {
     NapEncoder encoder;
     encodedNaplps = encoder.encode(input, 4);
 
-    ofLogNotice("DrawingMode") << "encoded " << input.size() << " strokes to "
+    ofLogNotice("DrawingMode") << "encoded " << strokes.size() << " strokes ("
+                               << input.size() << " polygons) to "
                                << encodedNaplps.size() << " bytes of NAPLPS";
 }

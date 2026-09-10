@@ -104,11 +104,19 @@ navigation position.
 
 `stop()` projects every stroke through the same camera the user was looking
 through and encodes the result with `NapEncoder`. Because NAPLPS has no line
-thickness, each stroke is encoded as its filled brush outline rather than its
-centreline — `Stroke::toBrushOutline()`, the same ribbon geometry that is drawn
-on screen. `ofApp` then shows the result on the NAPLPS canvas and publishes it.
-That round trip — hands to vectors to every other client — is what the app is
-for.
+thickness, a stroke is encoded as filled polygons rather than as its centreline
+— `Stroke::toBrushQuads()`, one short quad per segment. It is not the ribbon
+mesh that is drawn on screen, and the difference matters twice over. A quad
+built on one segment's own perpendicular is convex, so every renderer fills it
+alike whichever winding rule it uses, where a single long outline of the whole
+stroke crosses itself at every tight turn and fills differently on each. And
+every point in a polygon after the first is a *delta* from the one before it, so
+ending the polygon after four points resets that running cursor before the
+encoder's rounding error can grow into drift. The width is measured across the
+view rather than in the stroke's own plane, which is what keeps a stroke drawn
+towards the camera from arriving as a hairline. `ofApp` then shows the result on
+the NAPLPS canvas and publishes it. That round trip — hands to vectors to every
+other client — is what the app is for.
 
 The vertical squeeze in `convertToNaplps()` is not arbitrary: the canvas renders
 NAPLPS into a square space, so the 4:3 view is compressed by 480/640 and pushed
