@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <mutex>
+#include <thread>
 
 #include "ofMain.h"
 
@@ -9,9 +11,11 @@
 #include "ofxHTTP.h"
 #include "ofxJSONElement.h"
 #include "ofxCrypto.h"
+#include "ofxXmlSettings.h"
 
-#include "DrawingMode.h"
 #include "NapClient.h"
+#include "DrawingMode.h"
+
 
 // The largest drawing the player will accept over a websocket, matching
 // RPI_MAX_BYTES on the server. ofxHTTP defaults its websocket buffer to 8 KB,
@@ -24,6 +28,12 @@
 // Pinopticon apps use for websockets.
 #define WS_PORT 7112
 
+// Canvas constants matching the web client.
+const int kCanvasW = 640;
+const int kCanvasH = 480;
+const float kDrawAspect = (float)kCanvasW / (float)kCanvasH; // 4:3
+
+
 class ofApp : public ofBaseApp {
 
     public:
@@ -34,126 +44,70 @@ class ofApp : public ofBaseApp {
         void exit();
 
         void keyPressed(int key);
-        void keyReleased(int key);
-        void mouseMoved(int x, int y);
-        void mouseDragged(int x, int y, int button);
-        void mousePressed(int x, int y, int button);
-        void mouseReleased(int x, int y, int button);
-        void mouseScrolled(int x, int y, float scrollX, float scrollY);
         void windowResized(int w, int h);
         void dragEvent(ofDragInfo dragInfo);
 
         void loadNap(const std::string & filePath);
+        void scanSamples();
         void showNap(const std::string & napRaw, const std::string & label);
         void startDrawing();
         void updateLayout();
-
-        /// The browser's "clear" link: empties the canvas back to its
-        /// drag-and-drop placeholder.
-        void clearCanvas();
 
         Naplps naplps;   // the decoder,  ported from naplps.js
         Telidon telidon; // the renderer, ported from TelidonP5.js
 
         ofFbo fbo;
 
+        ofxXmlSettings settings;
+
         std::vector<std::string> samples;
         int sampleIndex;
 
-        // The browser's canvas is 640x480 (index.html: sW, sH), scaled to fill
-        // the window while keeping that aspect ratio and centred in it.
-        static constexpr float kCanvasW = 640.0f;
-        static constexpr float kCanvasH = 480.0f;
+        int fboWidth;
+        int fboHeight;
 
-        // Where that canvas lands in this window, in pixels.
-        glm::vec2 canvasSize;
-        glm::vec2 canvasOffset;
+        // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
+        // DEAD MAN'S SWITCH
+        //
+        // A player with nothing to play is indistinguishable from a broken
+        // one, so when the network goes quiet for slideTimeout ms the app
+        // falls back to the .nap files sitting in bin/data and shuffles
+        // through them every slideInterval ms. The first network drawing to
+        // arrive takes the screen back.
+        // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
 
-        // The NAPLPS unit screen runs from (0,0) to (1,1) and is rendered into a
-        // SQUARE the width of the canvas, then shifted up by the quarter that
-        // overhangs it -- index.html's `scale(scaleFactor); translate(0, sH-sW)`.
-        // So what shows is the bottom three quarters of that square, which is
-        // the convention the SVG importer and convertToNaplps() both encode to.
+        void checkDeadMansSwitch();
+        void loadRandomNap();
+
+        int slideTimeout;   // ms of silence before the fallback kicks in; 0 disables it
+        int slideInterval;  // ms between random drawings while it's running
+
+        uint64_t lastMessageTime; // when the last network drawing landed
+        uint64_t lastSlideTime;   // when the last random drawing was loaded
+        bool slideshowActive;
+
+        // The NAPLPS unit screen runs from (0,0) to (1,1), so it gets a square
+        // of the window, centered.
         float drawSize;
         glm::vec2 drawOffset;
 
-        /// False when nothing is loaded, which is the browser's empty state:
-        /// black, with the drag-and-drop prompt in the middle.
-        bool hasContent;
-        ofTrueTypeFont promptFont;
-        float promptFontSize;
-
-        /// Set once the startup chain read has been given up on, so the local
-        /// samples are only substituted in the once.
-        bool triedChainFallback;
-
+        bool debugView;
         bool progressiveDraw;
         bool labelPoints;
         bool showInfo;
+        bool hasContent = false;
+        bool triedChainFallback = false;
 
         bool bFboDirty;
         std::string infoText;
         void updateInfoText();
 
         // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
-        // LIVE DRAWING
+        // NETWORK (INBOUND - websocket server for nap-xtz-server)
         //
-        // The port of the browser's live drawing overlay. It runs instead of the
-        // NAPLPS canvas rather than over it: there is one window here, and the
-        // two views never made sense at once.
-        // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
-
-        DrawingMode drawingMode;
-
-        void enterDrawingMode();
-        void leaveDrawingMode();
-
-        // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
-        // SLIDESHOW
-        //
-        // Ported from index.html: plays a random .nap from bin/data on an
-        // interval. Loading anything deliberately, or entering live drawing,
-        // takes over from it.
-        // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
-
-        void startSlideshow();
-        void stopSlideshow();
-        void loadRandomNap();
-
-        bool slideshowActive;
-        float slideshowInterval; // seconds
-        float lastSlideTime;
-
-        /// The browser's slideshow pushes every frame it plays to the Pi. This
-        /// app may itself be the Pi that nap-xtz-server pushes to, in which case
-        /// doing the same would feed drawings straight back to us -- so it is
-        /// off unless deliberately turned on.
-        bool sendSlideshowToRpi;
-
-        // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
-        // NETWORK (OUTBOUND) -- the port of js/net/client.js
-        //
-        // Connects out to nap-xtz-server: receives drawings from every other
-        // client, publishes the ones made here, and reaches the chain through
-        // the server's REST API.
-        // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
-
-        NapClient client;
-
-        /// The drawing currently on screen, kept so it can be published or
-        /// minted. The browser calls this window.pendingNapRaw.
-        std::string pendingNapRaw;
-
-        void publishCurrent();
-        void mintCurrent();
-
-        // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
-        // NETWORK (INBOUND)
-        //
-        // nap-xtz-server also opens a websocket *to* this app and pushes
-        // drawings as its own canvas draws them. Both directions are live at
-        // once: this app is a client of the server and, at the same time, the
-        // Pinopticon player the server pushes to.
+        // nap-xtz-server opens a websocket to this app and pushes drawings as
+        // its own canvas draws them -- slideshow mode sends every frame it
+        // plays. See that project's OTHER SERVERS section in app.js.
         // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
 
         // One drawing lifted out of a websocket frame. nap is empty when the
@@ -185,4 +139,64 @@ class ofApp : public ofBaseApp {
         int received;
         int connections;
 
+        ofShader shader;
+        string shaderName;
+
+        // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
+        // TEZOS CHAIN READ
+        //
+        // A background thread polls TzKT for NAPLPS drawings stored
+        // on-chain. During Slideshow Mode the player alternates
+        // between local files and chain drawings; a failed or empty
+        // poll is handled silently and the local slideshow continues.
+        // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
+
+        std::string tzktBase;
+        std::string tezosContract;
+        int tezosPollSeconds;
+        int tezosMaxBytes;
+
+        std::thread tezosThread;
+        std::atomic<bool> tezosRunning{false};
+        std::mutex tezosMutex;
+        std::vector<std::string> tezosDrawings;
+        int tezosDrawingIndex;
+        bool slideshowFromChain;
+
+        void tezosThreadFunc();
+        bool loadChainNap();
+
+        // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
+        // NETWORK (OUTBOUND - client to nap-xtz-server)
+        //
+        // Connects to the nap-xtz-server backend for chain reads, minting,
+        // and sharing drawings with other clients.
+        // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
+
+        NapClient client;
+        std::string pendingNapRaw; // raw NAPLPS bytes of what's on screen
+
+        // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
+        // LIVE DRAWING MODE
+        // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
+
+        DrawingMode drawingMode;
+        ofTrueTypeFont promptFont;
+        float promptFontSize;
+
+        // The browser's canvas is a 4:3 box centred in the window.
+        // The NAPLPS artwork is a square shifted up by the quarter that
+        // doesn't fit (translate(0, sH - sW)).
+        glm::vec2 canvasSize;
+        glm::vec2 canvasOffset;
+
+        void clearCanvas();
+        void enterDrawingMode();
+        void leaveDrawingMode();
+
+        void startSlideshow();
+        void stopSlideshow();
+
+        void publishCurrent();
+        void mintCurrent();
 };

@@ -9,111 +9,6 @@
 // Stroke
 // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
 
-namespace {
-
-/// The pinch at each end of a stroke, in the stroke's own units.
-constexpr float kTipRadius = 0.01f;
-
-/// These three are in frame widths, the 0..1 space toBrushQuads() works in.
-constexpr float kMinStep = 0.0005f;   // 1/2048: a shorter step is a rounding error to the encoder
-constexpr float kMinRadius = 0.0005f; // keeps a quad from collapsing into a line
-
-/// How far inside the frame a clamped point is held. Each delta the encoder
-/// writes can fall a quantum short of where it was asked for, and a quad is four
-/// of them, so a point pinned to the very edge can decode just outside it -- and
-/// both renderers drop a point that lands outside rather than pulling it back.
-constexpr float kFrameMargin = 4.0f * kMinStep;
-
-/// Ramer-Douglas-Peucker over indices rather than points, so that anything held
-/// per point -- here the brush radius -- can follow the centreline through it.
-/// NapDraw::rdpSimplify() returns points, which loses that pairing.
-std::vector<size_t> simplifyIndices(const std::vector<glm::vec2> & points,
-                                    float epsilon, size_t first, size_t last) {
-    if (last - first < 2) return { first, last };
-
-    float maxDist = 0.0f;
-    size_t maxIdx = first;
-    for (size_t i = first + 1; i < last; i++) {
-        const float dist = NapDraw::rdpPointLineDist(points[i], points[first], points[last]);
-        if (dist > maxDist) {
-            maxDist = dist;
-            maxIdx = i;
-        }
-    }
-
-    if (maxDist > epsilon) {
-        std::vector<size_t> keep = simplifyIndices(points, epsilon, first, maxIdx);
-        const std::vector<size_t> right = simplifyIndices(points, epsilon, maxIdx, last);
-        keep.pop_back(); // maxIdx opens the right half
-        keep.insert(keep.end(), right.begin(), right.end());
-        return keep;
-    }
-    return { first, last };
-}
-
-/// Simplifies a centreline, carrying its radii along.
-Stroke::ScreenPath simplifyPath(const Stroke::ScreenPath & path, float epsilon) {
-    if (path.points.size() < 3) return path;
-
-    Stroke::ScreenPath out;
-    for (size_t i : simplifyIndices(path.points, epsilon, 0, path.points.size() - 1)) {
-        out.points.push_back(path.points[i]);
-        out.radii.push_back(path.radii[i]);
-    }
-    return out;
-}
-
-/// How far each quad has to reach past a corner to cover the wedge the next one
-/// leaves there: radius * tan(half the turn), which is nothing on a straight run
-/// and a whole radius at a right angle. Capped there, so a hairpin gets a blunt
-/// corner instead of a spike.
-std::vector<float> cornerReach(const std::vector<glm::vec2> & points,
-                               const std::vector<float> & radii) {
-    std::vector<float> reach(points.size(), 0.0f);
-
-    for (size_t i = 1; i + 1 < points.size(); i++) {
-        const glm::vec2 into = points[i] - points[i - 1];
-        const glm::vec2 outOf = points[i + 1] - points[i];
-        const float intoLen = glm::length(into);
-        const float outLen = glm::length(outOf);
-        if (intoLen < kMinStep || outLen < kMinStep) continue;
-
-        const float dot = glm::dot(into, outOf) / (intoLen * outLen);
-        const float cross = std::abs(into.x * outOf.y - into.y * outOf.x) / (intoLen * outLen);
-        const float halfTurn = cross / std::max(1e-6f, 1.0f + dot); // tan(turn / 2)
-
-        reach[i] = std::min(1.0f, halfTurn) * std::max(radii[i], kMinRadius);
-    }
-    return reach;
-}
-
-/// Whether any part of a polygon lies inside the 0..1 frame.
-bool touchesFrame(const std::vector<glm::vec2> & poly) {
-    if (poly.empty()) return false;
-
-    glm::vec2 lo = poly.front();
-    glm::vec2 hi = poly.front();
-    for (const glm::vec2 & p : poly) {
-        lo = glm::min(lo, p);
-        hi = glm::max(hi, p);
-    }
-    return lo.x <= 1.0f && hi.x >= 0.0f && lo.y <= 1.0f && hi.y >= 0.0f;
-}
-
-/// Pulls a polygon inside the frame, and far enough inside to still be there
-/// once it has been through the encoder.
-std::vector<glm::vec2> clampToFrame(const std::vector<glm::vec2> & poly) {
-    std::vector<glm::vec2> out;
-    out.reserve(poly.size());
-    for (const glm::vec2 & p : poly) {
-        out.push_back(glm::vec2(ofClamp(p.x, kFrameMargin, 1.0f - kFrameMargin),
-                                ofClamp(p.y, kFrameMargin, 1.0f - kFrameMargin)));
-    }
-    return out;
-}
-
-} // namespace
-
 //--------------------------------------------------------------
 void Stroke::addPoint(const glm::vec3 & point) {
     points.push_back(point);
@@ -227,13 +122,33 @@ void Stroke::buildEdges(std::vector<glm::vec3> & leftEdge,
     const size_t nPoints = points.size();
     const size_t lastIndex = nPoints - 1;
 
+    // Fall back to a locally computed taper when the cache is stale, so this
+    // stays const and callers don't have to remember to prime it.
+    std::vector<float> scratchPressures;
+    if (pressures.size() != nPoints) {
+        scratchPressures.reserve(nPoints);
+        for (size_t i = 0; i < nPoints; i++) {
+            const float t = (float)i / (float)std::max<size_t>(1, nPoints - 1) * PI;
+            scratchPressures.push_back(std::sqrt((1.0f - std::cos(t)) * 0.5f));
+        }
+    }
+    const std::vector<float> & pressureRef = scratchPressures.empty() ? pressures : scratchPressures;
+
     leftEdge.reserve(nPoints);
     rightEdge.reserve(nPoints);
 
     for (size_t i = 0; i < nPoints; i++) {
         const glm::vec3 & p = points[i];
 
-        const float radius = radiusAt(i);
+        float radius;
+        if (i == 0 || i == lastIndex) {
+            // Pin the ends narrow, or the taper flares out into a spade shape.
+            radius = 0.01f;
+        } else {
+            const float taper = std::pow((float)(lastIndex - i) / (float)std::max<size_t>(1, lastIndex), taperPower);
+            const float pressure = (i < pressureRef.size()) ? pressureRef[i] : 1.0f;
+            radius = std::max(minThickness * thickness, taper * pressure * thickness);
+        }
 
         glm::vec3 tangent;
         if (i == 0) {
@@ -252,15 +167,7 @@ void Stroke::buildEdges(std::vector<glm::vec3> & leftEdge,
             tangent /= tangentLength;
         }
 
-        // A stroke running along its own normal -- drawn straight at the camera,
-        // say -- has no perpendicular there, so fall back to one across the
-        // tangent rather than let the ribbon collapse to nothing.
-        glm::vec3 perp = glm::cross(tangent, normal);
-        if (glm::dot(perp, perp) < 1e-8f) {
-            perp = glm::vec3(-tangent.y, tangent.x, 0.0f);
-            if (glm::dot(perp, perp) < 1e-8f) perp = glm::vec3(0.0f, 1.0f, 0.0f);
-        }
-        perp = glm::normalize(perp);
+        const glm::vec3 perp = glm::normalize(glm::cross(tangent, normal));
 
         leftEdge.push_back(p + perp * radius);
         rightEdge.push_back(p - perp * radius);
@@ -304,108 +211,17 @@ const ofVboMesh & Stroke::getBrushMesh() {
 }
 
 //--------------------------------------------------------------
-float Stroke::radiusAt(size_t i) const {
-    if (points.size() < 2) return kTipRadius;
+std::vector<glm::vec3> Stroke::toBrushOutline() const {
+    std::vector<glm::vec3> outline;
+    if (points.size() < 2) return outline;
 
-    const size_t lastIndex = points.size() - 1;
-    if (i == 0 || i >= lastIndex) return kTipRadius;
+    std::vector<glm::vec3> leftEdge, rightEdge;
+    buildEdges(leftEdge, rightEdge);
 
-    const float taper = std::pow((float)(lastIndex - i) / (float)std::max<size_t>(1, lastIndex), taperPower);
-
-    // Fall back to a locally computed pressure when the cache is stale, so this
-    // stays const and callers don't have to remember to prime it.
-    const float pressure = (pressures.size() == points.size())
-        ? pressures[i]
-        : std::sqrt((1.0f - std::cos((float)i / (float)std::max<size_t>(1, lastIndex) * PI)) * 0.5f);
-
-    return std::max(minThickness * thickness, taper * pressure * thickness);
-}
-
-//--------------------------------------------------------------
-Stroke::ScreenPath Stroke::toScreenPath(const ProjectFn & project, const glm::vec3 & widthAxis) const {
-    ScreenPath path;
-    if (points.empty()) return path;
-
-    const size_t lastIndex = points.size() - 1;
-
-    for (size_t i = 0; i <= lastIndex; i++) {
-        const glm::vec2 centre = project(points[i]);
-        const glm::vec2 edge = project(points[i] + widthAxis * radiusAt(i));
-        const float radius = glm::length(edge - centre);
-
-        // A point the encoder can't tell from the last one costs four bytes and
-        // says nothing -- but never drop the tip, or the stroke shortens, and
-        // keep the widest radius of the points that fall together so a slow
-        // passage doesn't come out thin.
-        if (!path.points.empty() && i != lastIndex &&
-            glm::length(centre - path.points.back()) < kMinStep) {
-            path.radii.back() = std::max(path.radii.back(), radius);
-            continue;
-        }
-
-        path.points.push_back(centre);
-        path.radii.push_back(radius);
-    }
-
-    return path;
-}
-
-//--------------------------------------------------------------
-std::vector<std::vector<glm::vec2>> Stroke::toBrushQuads(const ProjectFn & project,
-                                                         const glm::vec3 & widthAxis,
-                                                         float epsilon) const {
-    std::vector<std::vector<glm::vec2>> quads;
-    if (points.size() < 2) return quads;
-
-    const ScreenPath path = simplifyPath(toScreenPath(project, widthAxis), epsilon);
-    const std::vector<glm::vec2> & centre = path.points;
-    const std::vector<float> & radii = path.radii;
-    if (centre.empty()) return quads;
-
-    const std::vector<float> reach = cornerReach(centre, radii);
-    const size_t segments = centre.size() - 1;
-
-    for (size_t i = 0; i < segments; i++) {
-        const glm::vec2 & a = centre[i];
-        const glm::vec2 & b = centre[i + 1];
-        const float length = glm::length(b - a);
-        if (length < kMinStep) continue;
-
-        const glm::vec2 t = (b - a) / length;
-        const glm::vec2 n = glm::vec2(-t.y, t.x);
-        const float ra = std::max(radii[i], kMinRadius);
-        const float rb = std::max(radii[i + 1], kMinRadius);
-
-        // Reach into the neighbouring segments, but not past the stroke's own ends
-        const glm::vec2 from = a - t * ((i > 0) ? reach[i] : 0.0f);
-        const glm::vec2 to = b + t * ((i + 1 < segments) ? reach[i + 1] : 0.0f);
-
-        const std::vector<glm::vec2> quad = {
-            from + n * ra, to + n * rb, to - n * rb, from - n * ra
-        };
-
-        // The encoder silently drops a point outside the frame, and every point
-        // after it in that polygon is a delta from the one dropped, so the rest
-        // of the shape lands somewhere else entirely. Keep the quads that touch
-        // the frame and clamp them into it; skip the rest.
-        if (touchesFrame(quad)) quads.push_back(clampToFrame(quad));
-    }
-
-    // A stroke can land on a single spot -- drawn straight at the camera, or
-    // held still. There was paint on it, so leave a dab rather than nothing.
-    if (quads.empty()) {
-        float r = kMinRadius;
-        for (const float radius : radii) r = std::max(r, radius);
-
-        const glm::vec2 c = centre.front();
-        const std::vector<glm::vec2> dab = {
-            glm::vec2(c.x - r, c.y - r), glm::vec2(c.x + r, c.y - r),
-            glm::vec2(c.x + r, c.y + r), glm::vec2(c.x - r, c.y + r)
-        };
-        if (touchesFrame(dab)) quads.push_back(clampToFrame(dab));
-    }
-
-    return quads;
+    outline.reserve(leftEdge.size() + rightEdge.size());
+    outline.insert(outline.end(), leftEdge.begin(), leftEdge.end());
+    outline.insert(outline.end(), rightEdge.rbegin(), rightEdge.rend());
+    return outline;
 }
 
 // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~

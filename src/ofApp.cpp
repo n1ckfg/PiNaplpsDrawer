@@ -1,41 +1,76 @@
 #include "ofApp.h"
 
+#include <cctype>
+
 #include "Pinopticon.hpp"
 #include "Pinopticon_Http.hpp"
 
 using namespace Pinopticon;
 
+// Walk a TzKT JSON value and collect strings that could be NAPLPS data.
+// Tezos `bytes` values arrive hex-encoded; plain `string` values arrive as-is.
+static void collectNaplpsStrings(const ofJson& j, std::vector<std::string>& out, int maxBytes) {
+    if (j.is_string()) {
+        std::string val = j.get<std::string>();
+        if (val.size() < 10) return;
+
+        bool allHex = (val.size() % 2 == 0);
+        if (allHex) {
+            for (char c : val) {
+                if (!std::isxdigit(static_cast<unsigned char>(c))) { allHex = false; break; }
+            }
+        }
+
+        if (allHex && (int)val.size() >= 20) {
+            std::string decoded;
+            decoded.reserve(val.size() / 2);
+            for (std::size_t i = 0; i < val.size(); i += 2) {
+                unsigned int byte = 0;
+                std::sscanf(val.c_str() + i, "%02x", &byte);
+                decoded.push_back(static_cast<char>(byte));
+            }
+            if ((int)decoded.size() <= maxBytes) out.push_back(std::move(decoded));
+        } else if ((int)val.size() <= maxBytes) {
+            out.push_back(val);
+        }
+    } else if (j.is_object()) {
+        for (auto& el : j.items()) collectNaplpsStrings(el.value(), out, maxBytes);
+    } else if (j.is_array()) {
+        for (auto& el : j) collectNaplpsStrings(el, out, maxBytes);
+    }
+}
+
 //--------------------------------------------------------------
 void ofApp::setup() {
-    ofSetWindowTitle("nap-xtz-client");
+    ofSetWindowTitle("PiNaplpsPlayer");
     ofSetFrameRate(60);
+    //ofSetVerticalSync(true);
+    //ofEnableAntiAliasing();
+    //ofEnableAlphaBlending(); // Alpha disabled for performance
     ofBackground(0);
+    ofHideCursor();
 
-    // the other sample files in bin/data, cycled through with the arrow keys
-    samples.push_back("shark.nap");
-    samples.push_back("santa.nap");
-    samples.push_back("beer.nap");
-    samples.push_back("haunt.nap");
-    samples.push_back("wast.nap");
-    samples.push_back("email2.nap");
+    settings.loadFile("settings.xml");
+    slideTimeout = settings.getValue("settings:slide_timeout", 30000);
+    slideInterval = settings.getValue("settings:slide_interval", 10000);
+
+    fboWidth = settings.getValue("settings:fbo_width", 640);
+    fboHeight = settings.getValue("settings:fbo_height", 480);
+
+    // the sample files in bin/data, cycled through with the arrow keys and
+    // drawn from at random by the dead man's switch
+    scanSamples();
     sampleIndex = 0;
 
+    debugView = (bool) settings.getValue("settings:debug_view", 0);
     progressiveDraw = true;
-    labelPoints = false;
-    showInfo = false;
+    labelPoints = debugView;
+    showInfo = debugView;
     bFboDirty = true;
 
-    slideshowActive = false;
-    slideshowInterval = 10.0f;
-    lastSlideTime = 0.0f;
-    sendSlideshowToRpi = false;
-
-    hasContent = false;
-    triedChainFallback = false;
-    promptFontSize = 0.0f;
-
     updateLayout();
-    napSource = "none";
+    if (!samples.empty()) loadNap(samples[sampleIndex]);
+    napSource = "file";
 
     // The websocket server starts listening the moment it's set up, so
     // everything a frame touches has to be ready first.
@@ -44,7 +79,50 @@ void ofApp::setup() {
     connections = 0;
     hostName = Pinopticon::getHostName();
 
+    // Nothing has arrived yet, so the clock starts now: an app that comes up
+    // with no server on the other end falls back after one timeout.
+    ofSeedRandom();
+    lastMessageTime = ofGetElapsedTimeMillis();
+    lastSlideTime = lastMessageTime;
+    slideshowActive = false;
+
     Pinopticon::setupWsServer(this, wsServer, WS_PORT, MAX_NAP_BYTES);
+
+    fbo.allocate(fboWidth, fboHeight, GL_RGB);
+
+    shaderName = settings.getValue("settings:shader_name", "vhsc");
+
+#ifdef TARGET_OPENGLES
+    shader.load("shaders/" + shaderName + "_es3");
+#else
+    if (ofIsGLProgrammableRenderer()) {
+        shader.load("shaders/" + shaderName + "_gl3");
+    } else {
+        shader.load("shaders/" + shaderName + "_gl2");
+    }
+#endif
+
+    if (!shader.isLoaded()) {
+        ofLogWarning("PiNaplpsPlayer") << "shader " << shaderName << " didn't load, drawing without it";
+    }
+
+    tezosContract = settings.getValue("settings:tezos_contract", "KT1DypSEV87pwiw6swdYqhDKWRBZ7xfqeS3c");
+    tzktBase = settings.getValue("settings:tzkt_base", "https://api.shadownet.tzkt.io/v1");
+    tezosPollSeconds = settings.getValue("settings:tezos_poll_seconds", 30);
+    tezosMaxBytes = settings.getValue("settings:tezos_max_bytes", 30000);
+    tezosDrawingIndex = 0;
+    slideshowFromChain = false;
+
+    if (!tezosContract.empty()) {
+        // No bin/data/ssl/cacert.pem ships with the app, and ofSSLManager's fallback
+        // context trusts nothing. Use the OS trust store instead.
+        ofSSLManager::initializeClient(new Poco::Net::Context(
+            Poco::Net::Context::TLS_CLIENT_USE, "",
+            Poco::Net::Context::VERIFY_RELAXED, 9, true /* loadDefaultCAs */));
+
+        tezosRunning = true;
+        tezosThread = std::thread(&ofApp::tezosThreadFunc, this);
+    }
 
     // ~ ~ ~ outbound link to nap-xtz-server ~ ~ ~
     // Overridable from bin/data/settings.json, so a Pi in an installation can
@@ -62,14 +140,8 @@ void ofApp::setup() {
         if (settingsJson.isMember("server_http_port")) {
             clientSettings.httpPort = settingsJson["server_http_port"].asInt();
         }
-        if (settingsJson.isMember("slideshow_interval")) {
-            slideshowInterval = settingsJson["slideshow_interval"].asFloat();
-        }
-        if (settingsJson.isMember("slideshow_to_rpi")) {
-            sendSlideshowToRpi = settingsJson["slideshow_to_rpi"].asBool();
-        }
     } else {
-        ofLogNotice("nap-xtz-client") << "no settings.json, using defaults";
+        ofLogNotice("PiNaplpsPlayer") << "no settings.json, using defaults";
     }
 
     client.setup(clientSettings);
@@ -88,14 +160,9 @@ void ofApp::setup() {
 }
 
 //--------------------------------------------------------------
-void ofApp::exit() {
-    drawingMode.exit();
-    client.stop();
-}
-
-//--------------------------------------------------------------
 void ofApp::loadNap(const std::string & filePath) {
     // 1. decode the file
+    //naplps.setVerbose(true); // uncomment to log every command and point
     if (!naplps.load(filePath)) return;
 
     // Keep the raw bytes: publishing or minting what's on screen needs them.
@@ -106,13 +173,34 @@ void ofApp::loadNap(const std::string & filePath) {
 }
 
 //--------------------------------------------------------------
+// Whatever .nap files are in bin/data, in name order -- reading the directory
+// rather than a hardcoded list means a drawing dropped in there is picked up
+// by both the arrow keys and the dead man's switch.
+void ofApp::scanSamples() {
+    samples.clear();
+
+    ofDirectory dir(ofToDataPath("", true));
+    dir.allowExt("nap");
+    dir.sort();
+    dir.listDir();
+
+    for (std::size_t i = 0; i < dir.size(); i++) {
+        samples.push_back(dir.getName(i));
+    }
+
+    if (samples.empty()) {
+        ofLogWarning("PiNaplpsPlayer") << "no .nap files in bin/data";
+    }
+}
+
+//--------------------------------------------------------------
 // The same thing for a drawing that arrived over the network: the bytes are
 // already in hand, so they go straight to the decoder without touching a file.
 void ofApp::showNap(const std::string & napRaw, const std::string & label) {
     naplps.decode(napRaw);
 
     if (!naplps.isLoaded()) {
-        ofLogWarning("nap-xtz-client") << "nothing to draw in " << label;
+        ofLogWarning("PiNaplpsPlayer") << "nothing to draw in " << label;
         return;
     }
 
@@ -125,7 +213,6 @@ void ofApp::showNap(const std::string & napRaw, const std::string & label) {
 
 //--------------------------------------------------------------
 void ofApp::startDrawing() {
-    hasContent = true;
     telidon.setup(naplps, drawSize, drawSize);
     telidon.setProgressiveDraw(progressiveDraw);
     telidon.setLabelPoints(labelPoints);
@@ -133,54 +220,9 @@ void ofApp::startDrawing() {
 }
 
 //--------------------------------------------------------------
-// index.html's setup()/windowResized(), plus #main-canvas in css/main.css: the
-// 640x480 canvas is scaled to fill the window without distorting it, and
-// centred. Inside it the artwork is drawn into a square as wide as the canvas
-// and shifted up by the quarter that doesn't fit.
 void ofApp::updateLayout() {
-    const float scaleFactor = std::min(ofGetWidth() / kCanvasW, ofGetHeight() / kCanvasH);
-
-    canvasSize = glm::vec2(kCanvasW * scaleFactor, kCanvasH * scaleFactor);
-    canvasOffset = glm::vec2((ofGetWidth() - canvasSize.x) * 0.5f,
-                             (ofGetHeight() - canvasSize.y) * 0.5f);
-
-    drawSize = canvasSize.x;                                   // square art space
-    drawOffset = glm::vec2(0.0f, canvasSize.y - canvasSize.x); // translate(0, sH - sW)
-
-    // The FBO holds the canvas at its own size, so drawing it is a straight blit
-    // rather than a rescale -- the previous fixed 720x540 buffer was being drawn
-    // into 720x480 and squashing every drawing by a ninth.
-    const int fboW = std::max(1, (int)std::round(canvasSize.x));
-    const int fboH = std::max(1, (int)std::round(canvasSize.y));
-    if (!fbo.isAllocated() || (int)fbo.getWidth() != fboW || (int)fbo.getHeight() != fboH) {
-        fbo.allocate(fboW, fboH, GL_RGB);
-        fbo.begin();
-        ofClear(0, 0, 0, 255);
-        fbo.end();
-    }
-
-    // The prompt is 36px against a 480-tall canvas in the browser; keep it that
-    // fraction of the height here so it scales with the window.
-    const float wantSize = std::max(8.0f, canvasSize.y * (36.0f / kCanvasH));
-    if (std::abs(wantSize - promptFontSize) > 0.5f) {
-        promptFontSize = wantSize;
-        if (!promptFont.load("Telidon-Bold.ttf", (int)promptFontSize, true, true)) {
-            promptFont.load(OF_TTF_SANS, (int)promptFontSize, true, true);
-        }
-    }
-
-    bFboDirty = true;
-}
-
-//--------------------------------------------------------------
-// The browser's "clear" link: drop the drawing and stop the slideshow, leaving
-// the placeholder behind.
-void ofApp::clearCanvas() {
-    stopSlideshow();
-    hasContent = false;
-    pendingNapRaw.clear();
-    napSource = "none";
-    naplps.fileName = "";
+    drawSize = fboWidth; //MIN(ofGetWidth(), ofGetHeight());
+    drawOffset = glm::vec2(0, fboHeight - fboWidth); //glm::vec2((ofGetWidth() - drawSize) / 2.0f, (ofGetHeight() - drawSize) / 2.0f);
     bFboDirty = true;
 }
 
@@ -254,7 +296,7 @@ void ofApp::update() {
     }
 
     // ~ ~ ~ slideshow ~ ~ ~
-    if (slideshowActive && ofGetElapsedTimef() - lastSlideTime >= slideshowInterval) {
+    if (slideshowActive && ofGetElapsedTimef() - lastSlideTime >= slideInterval) {
         loadRandomNap();
     }
 
@@ -324,109 +366,174 @@ void ofApp::draw() {
     }
 }
 
-// ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
-// LIVE DRAWING
-// ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
-
 //--------------------------------------------------------------
-void ofApp::enterDrawingMode() {
-    // The browser's Live Drawing button empties the canvas (`telidon = []`) on
-    // the way in, so leaving without drawing anything lands back on the
-    // placeholder rather than on whatever was there before.
-    clearCanvas();
-    ofShowCursor();
-    drawingMode.start();
-}
+void ofApp::checkDeadMansSwitch() {
+    if (slideTimeout <= 0) return;
 
-//--------------------------------------------------------------
-void ofApp::leaveDrawingMode() {
-    drawingMode.stop(); // encodes whatever was drawn
+    bool hasChain;
+    {
+        std::lock_guard<std::mutex> lock(tezosMutex);
+        hasChain = !tezosDrawings.empty();
+    }
 
-    const std::string encoded = drawingMode.getEncodedNaplps();
-    if (encoded.empty()) {
-        ofLogNotice("nap-xtz-client") << "left drawing mode with nothing drawn";
-        bFboDirty = true;
+    if (samples.empty() && !hasChain) return;
+
+    const uint64_t now = ofGetElapsedTimeMillis();
+
+    if (!slideshowActive) {
+        if (now - lastMessageTime < (uint64_t)slideTimeout) return;
+
+        ofLogNotice("PiNaplpsPlayer") << "no drawing in " << slideTimeout
+                                      << "ms, falling back to slideshow";
+        slideshowActive = true;
+        slideshowFromChain = false;
+        if (!samples.empty()) {
+            loadRandomNap();
+        } else {
+            loadChainNap();
+        }
         return;
     }
 
-    // Show it on the NAPLPS canvas, then share it. This is the round trip the
-    // whole app exists for: hands to vectors to every other client.
-    showNap(encoded, "(live drawing)");
-    napSource = "drawing";
-
-    client.publish(encoded, "drawing");
-    drawingMode.clearEncodedNaplps();
-}
-
-// ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
-// SLIDESHOW
-// ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
-
-//--------------------------------------------------------------
-void ofApp::startSlideshow() {
-    if (drawingMode.isActive() || slideshowActive) return;
-    slideshowActive = true;
-    loadRandomNap();
+    if (slideInterval > 0 && now - lastSlideTime >= (uint64_t)slideInterval) {
+        if (slideshowFromChain) {
+            if (!loadChainNap()) {
+                if (!samples.empty()) loadRandomNap();
+            }
+            slideshowFromChain = false;
+        } else {
+            if (!samples.empty()) {
+                loadRandomNap();
+            } else {
+                loadChainNap();
+            }
+            slideshowFromChain = hasChain;
+        }
+    }
 }
 
 //--------------------------------------------------------------
-void ofApp::stopSlideshow() {
-    slideshowActive = false;
-}
-
-//--------------------------------------------------------------
+// A random file from bin/data, never the one already on screen -- repeating a
+// drawing reads as a frozen player, which is the thing the switch exists to
+// avoid.
 void ofApp::loadRandomNap() {
-    if (samples.empty()) return;
+    const int count = (int)samples.size();
+    int index = (int)ofRandom(count);
+    if (index >= count) index = count - 1; // ofRandom's top end is inclusive
 
-    // Picked at random rather than in order, matching the browser. Repeats are
-    // possible and that's fine for an ambient display.
-    const int index = (int)ofRandom(0, samples.size());
-    sampleIndex = std::min(index, (int)samples.size() - 1);
+    if (count > 1 && index == sampleIndex) index = (index + 1) % count;
 
-    if (!naplps.load(samples[sampleIndex])) return;
-    pendingNapRaw = naplps.napRaw;
-    startDrawing();
+    sampleIndex = index;
+    lastSlideTime = ofGetElapsedTimeMillis();
 
-    napSource = "slideshow";
-    lastSlideTime = ofGetElapsedTimef();
-
-    // The browser's slideshow mirrors every frame to the Pi. Off by default
-    // here, because this app may be that Pi -- see the header.
-    if (sendSlideshowToRpi) client.sendToRpi(pendingNapRaw, "slideshow");
-}
-
-// ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
-// NETWORK (OUTBOUND)
-// ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
-
-//--------------------------------------------------------------
-void ofApp::publishCurrent() {
-    if (pendingNapRaw.empty()) {
-        ofLogNotice("nap-xtz-client") << "nothing on screen to publish";
-        return;
-    }
-    client.publish(pendingNapRaw, "client");
-    ofLogNotice("nap-xtz-client") << "published " << pendingNapRaw.size() << " bytes";
+    loadNap(samples[sampleIndex]);
+    napSource = "random";
 }
 
 //--------------------------------------------------------------
-void ofApp::mintCurrent() {
-    if (pendingNapRaw.empty()) {
-        ofLogNotice("nap-xtz-client") << "nothing on screen to mint";
-        return;
+bool ofApp::loadChainNap() {
+    std::string nap;
+    {
+        std::lock_guard<std::mutex> lock(tezosMutex);
+        if (tezosDrawings.empty()) return false;
+
+        int count = (int)tezosDrawings.size();
+        int index = (int)ofRandom(count);
+        if (index >= count) index = count - 1;
+        if (count > 1 && index == tezosDrawingIndex) index = (index + 1) % count;
+        tezosDrawingIndex = index;
+        nap = tezosDrawings[index];
     }
 
-    // The browser signs with a Beacon wallet. There is no Beacon for C++, so
-    // this asks the server to sign with its own key; it answers with a clear
-    // error when TEZOS_SECRET_KEY isn't configured there.
-    client.mintAsync(pendingNapRaw);
-    showInfo = true; // so the result is visible when it lands
-    updateInfoText();
+    lastSlideTime = ofGetElapsedTimeMillis();
+    showNap(nap, "(chain)");
+    napSource = "chain";
+    return true;
 }
 
-// ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
-// NETWORK (INBOUND)
-// ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
+//--------------------------------------------------------------
+void ofApp::tezosThreadFunc() {
+    for (int i = 0; i < 5 && tezosRunning; i++) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    while (tezosRunning) {
+        std::vector<std::string> found;
+
+        try {
+            ofxHTTP::Client client;
+
+            {
+                std::string url = tzktBase + "/contracts/" + tezosContract + "/bigmaps";
+                ofxHTTP::GetRequest req(url);
+                auto resp = client.execute(req);
+
+                if (resp->isSuccess()) {
+                    ofJson bigmaps = resp->json();
+                    if (bigmaps.is_array()) {
+                        for (auto& bm : bigmaps) {
+                            if (!tezosRunning) break;
+                            if (!bm.contains("ptr") || bm.value("activeKeys", 0) == 0) continue;
+
+                            int ptr = bm["ptr"].get<int>();
+                            std::string keysUrl = tzktBase + "/bigmaps/" + ofToString(ptr)
+                                                  + "/keys?active=true&limit=100";
+                            ofxHTTP::GetRequest keysReq(keysUrl);
+                            auto keysResp = client.execute(keysReq);
+
+                            if (keysResp->isSuccess()) {
+                                ofJson keys = keysResp->json();
+                                if (keys.is_array()) {
+                                    for (auto& entry : keys) {
+                                        if (entry.contains("value")) {
+                                            collectNaplpsStrings(entry["value"], found, tezosMaxBytes);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (found.empty() && tezosRunning) {
+                std::string url = tzktBase + "/contracts/" + tezosContract + "/storage";
+                ofxHTTP::GetRequest req(url);
+                auto resp = client.execute(req);
+
+                if (resp->isSuccess()) {
+                    collectNaplpsStrings(resp->json(), found, tezosMaxBytes);
+                }
+            }
+
+        } catch (const Poco::Exception& e) {
+            ofLogWarning("Tezos") << "poll failed: " << e.displayText();
+        } catch (const std::exception& e) {
+            ofLogWarning("Tezos") << "poll failed: " << e.what();
+        } catch (...) {
+            ofLogWarning("Tezos") << "poll failed";
+        }
+
+        if (!found.empty()) {
+            std::lock_guard<std::mutex> lock(tezosMutex);
+            tezosDrawings = std::move(found);
+            ofLogNotice("Tezos") << "cached " << tezosDrawings.size() << " drawings from chain";
+        }
+
+        for (int i = 0; i < tezosPollSeconds && tezosRunning; i++) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+}
+
+//--------------------------------------------------------------
+void ofApp::exit() {
+    tezosRunning = false;
+    if (tezosThread.joinable()) tezosThread.join();
+    
+    drawingMode.exit();
+    client.stop();
+}
 
 //--------------------------------------------------------------
 // Frames from nap-xtz-server arrive in one of three shapes, set by
@@ -453,7 +560,7 @@ ofApp::NapFrame ofApp::parseNapFrame(const std::string & text) const {
 
     ofxJSONElement json;
     if (!json.parse(text)) {
-        ofLogWarning("nap-xtz-client") << "frame wasn't valid JSON";
+        ofLogWarning("PiNaplpsPlayer") << "frame wasn't valid JSON";
         return frame;
     }
 
@@ -475,21 +582,23 @@ ofApp::NapFrame ofApp::parseNapFrame(const std::string & text) const {
 //--------------------------------------------------------------
 void ofApp::onWebSocketOpenEvent(ofxHTTP::WebSocketEventArgs & evt) {
     connections++;
-    ofLogNotice("nap-xtz-client") << "websocket opened: " << evt.connection().clientAddress().toString();
+    ofLogNotice("PiNaplpsPlayer") << "websocket opened: " << evt.connection().clientAddress().toString();
 }
 
 //--------------------------------------------------------------
 void ofApp::onWebSocketCloseEvent(ofxHTTP::WebSocketCloseEventArgs & evt) {
     if (connections > 0) connections--;
-    ofLogNotice("nap-xtz-client") << "websocket closed: " << evt.connection().clientAddress().toString();
+    ofLogNotice("PiNaplpsPlayer") << "websocket closed: " << evt.connection().clientAddress().toString();
 }
 
 //--------------------------------------------------------------
 void ofApp::onWebSocketFrameReceivedEvent(ofxHTTP::WebSocketFrameEventArgs & evt) {
-    const NapFrame frame = parseNapFrame(evt.frame().toString());
+    std::string payload;
+    evt.frame().readBytes(payload);
+    const NapFrame frame = parseNapFrame(payload);
     if (frame.nap.empty()) return;
 
-    ofLogNotice("nap-xtz-client") << "received " << frame.nap.size() << " bytes of NAPLPS"
+    ofLogNotice("PiNaplpsPlayer") << "received " << frame.nap.size() << " bytes of NAPLPS"
                                   << (frame.source.empty() ? "" : " from " + frame.source);
 
     // Hand it to update(); this is a server thread, not the GL thread.
@@ -501,35 +610,16 @@ void ofApp::onWebSocketFrameReceivedEvent(ofxHTTP::WebSocketFrameEventArgs & evt
 
 //--------------------------------------------------------------
 void ofApp::onWebSocketFrameSentEvent(ofxHTTP::WebSocketFrameEventArgs & evt) {
-    // nothing to do -- this side only listens
+    // nothing to do -- the player only listens
 }
 
 //--------------------------------------------------------------
 void ofApp::onWebSocketErrorEvent(ofxHTTP::WebSocketErrorEventArgs & evt) {
-    ofLogWarning("nap-xtz-client") << "websocket error: " << evt.connection().clientAddress().toString();
+    ofLogWarning("PiNaplpsPlayer") << "websocket error: " << evt.connection().clientAddress().toString();
 }
-
-// ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
-// INPUT
-// ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
 
 //--------------------------------------------------------------
 void ofApp::keyPressed(int key) {
-    // 'd' and fullscreen work in both modes; everything else belongs to one.
-    if (key == 'd') {
-        if (drawingMode.isActive()) {
-            leaveDrawingMode();
-        } else {
-            enterDrawingMode();
-        }
-        return;
-    }
-
-    if (key == 'f') {
-        ofToggleFullscreen();
-        return;
-    }
-
     if (drawingMode.isActive()) {
         drawingMode.keyPressed(key);
         return;
@@ -542,17 +632,23 @@ void ofApp::keyPressed(int key) {
             break;
         case OF_KEY_RIGHT:
         case OF_KEY_DOWN:
-            stopSlideshow();
+            if (samples.empty()) break;
             sampleIndex = (sampleIndex + 1) % (int)samples.size();
             loadNap(samples[sampleIndex]);
             napSource = "file";
+            // A hand on the keys outranks the switch: hold this drawing for a
+            // full timeout before the slideshow takes over again.
+            lastMessageTime = ofGetElapsedTimeMillis();
+            slideshowActive = false;
             break;
         case OF_KEY_LEFT:
         case OF_KEY_UP:
-            stopSlideshow();
+            if (samples.empty()) break;
             sampleIndex = (sampleIndex + (int)samples.size() - 1) % (int)samples.size();
             loadNap(samples[sampleIndex]);
             napSource = "file";
+            lastMessageTime = ofGetElapsedTimeMillis();
+            slideshowActive = false;
             break;
         case 'p':
             progressiveDraw = !progressiveDraw;
@@ -568,30 +664,24 @@ void ofApp::keyPressed(int key) {
             showInfo = !showInfo;
             if (showInfo) updateInfoText();
             break;
-        case 's':
-            if (slideshowActive) {
-                stopSlideshow();
-            } else {
-                startSlideshow();
-            }
+        case 'f':
+            ofToggleFullscreen();
             break;
-        case 'n':
+        case 'd':
+            // 'd' for drawing mode
+            enterDrawingMode();
+            break;
+        case 's':
+            // 's' for slideshow
+            if (slideshowActive) stopSlideshow(); else startSlideshow();
+            break;
+        case 'c':
+            // 'c' for publish current drawing
             publishCurrent();
             break;
         case 'm':
+            // 'm' for mint current drawing
             mintCurrent();
-            break;
-        case 'c':
-            // The browser's "latest" link: clear the canvas, then ask the chain.
-            // The answer comes back through the message queue in update(), so
-            // the window keeps drawing while the request is out -- doing it
-            // inline froze the app for the length of the round trip.
-            clearCanvas();
-            client.fetchLatestAsync();
-            break;
-        case 'x':
-            // The browser's "clear" link.
-            clearCanvas();
             break;
         default:
             break;
@@ -599,49 +689,23 @@ void ofApp::keyPressed(int key) {
 }
 
 //--------------------------------------------------------------
-void ofApp::keyReleased(int key) {
-    if (drawingMode.isActive()) drawingMode.keyReleased(key);
-}
-
-//--------------------------------------------------------------
-void ofApp::mouseMoved(int x, int y) {
-    if (drawingMode.isActive()) drawingMode.mouseMoved(x, y);
-}
-
-//--------------------------------------------------------------
-void ofApp::mouseDragged(int x, int y, int button) {
-    if (drawingMode.isActive()) drawingMode.mouseDragged(x, y, button);
-}
-
-//--------------------------------------------------------------
-void ofApp::mousePressed(int x, int y, int button) {
-    if (drawingMode.isActive()) drawingMode.mousePressed(x, y, button);
-}
-
-//--------------------------------------------------------------
-void ofApp::mouseReleased(int x, int y, int button) {
-    if (drawingMode.isActive()) drawingMode.mouseReleased(x, y, button);
-}
-
-//--------------------------------------------------------------
-void ofApp::mouseScrolled(int x, int y, float scrollX, float scrollY) {
-    if (drawingMode.isActive()) drawingMode.mouseScrolled(scrollY);
-}
-
-//--------------------------------------------------------------
 void ofApp::windowResized(int w, int h) {
     updateLayout();
-    if (hasContent) telidon.setSize(drawSize, drawSize);
+    telidon.setSize(drawSize, drawSize);
+    
+    if (drawingMode.isActive()) {
+        // DrawingMode handles its own viewport in getViewport()
+    }
 }
 
 //--------------------------------------------------------------
 void ofApp::dragEvent(ofDragInfo dragInfo) {
     if (dragInfo.files.size() < 1) return;
-    if (drawingMode.isActive()) return;
 
-    stopSlideshow(); // a deliberate load takes over from the slideshow
     loadNap(dragInfo.files[0]);
     napSource = "file";
+    lastMessageTime = ofGetElapsedTimeMillis();
+    slideshowActive = false;
 }
 
 //--------------------------------------------------------------
@@ -650,24 +714,104 @@ void ofApp::updateInfoText() {
     infoText += "Telidon " + ofToString(naplps.version) + ", " + ofToString(naplps.cmds.size()) + " commands\n";
     infoText += telidon.isFinished() ? "finished\n" : "drawing...\n";
     infoText += "source: " + napSource + "\n";
-    infoText += "\n";
-    infoText += "server: " + client.getStatusText() + "\n";
-    if (!client.getMintStatus().empty()) {
-        infoText += "mint:   " + client.getMintStatus() + "\n";
+    if (slideshowActive) {
+        infoText += "no signal: slideshow every " + ofToString(slideInterval) + "ms\n";
     }
-    infoText += "listening on ws://" + hostName + ":" + ofToString(WS_PORT) + "\n";
+    {
+        std::lock_guard<std::mutex> lock(tezosMutex);
+        infoText += "chain: " + ofToString(tezosDrawings.size()) + " cached";
+        if (!tezosContract.empty()) infoText += " (polling)";
+        infoText += "\n";
+    }
+    infoText += "\n";
+    infoText += "ws://" + hostName + ":" + ofToString(WS_PORT) + "\n";
     infoText += ofToString(connections) + " connected, " + ofToString(received) + " received\n";
     infoText += "\n";
-    infoText += "d:      live drawing\n";
-    infoText += "s:      slideshow " + std::string(slideshowActive ? "on" : "off") + "\n";
-    infoText += "n:      publish this drawing\n";
-    infoText += "m:      mint this drawing\n";
-    infoText += "c:      load latest from chain\n";
-    infoText += "x:      clear\n";
     infoText += "arrows: next/prev file\n";
     infoText += "space:  redraw\n";
     infoText += "p:      progressive draw " + std::string(progressiveDraw ? "on" : "off") + "\n";
     infoText += "l:      label points " + std::string(labelPoints ? "on" : "off") + "\n";
     infoText += "i:      hide this\n";
+    infoText += "d:      enter drawing mode\n";
+    infoText += "s:      toggle slideshow\n";
+    infoText += "c:      publish current drawing\n";
+    infoText += "m:      mint current drawing\n";
     infoText += "(or drop a .nap file on the window)";
+}
+
+//--------------------------------------------------------------
+void ofApp::clearCanvas() {
+    stopSlideshow();
+    hasContent = false;
+    pendingNapRaw.clear();
+    napSource = "none";
+    naplps.fileName = "";
+    bFboDirty = true;
+}
+
+//--------------------------------------------------------------
+void ofApp::enterDrawingMode() {
+    // The browser's Live Drawing button empties the canvas (`telidon = []`) on
+    // the way in, so leaving without drawing anything lands back on the
+    // placeholder rather than on whatever was there before.
+    clearCanvas();
+    ofShowCursor();
+    drawingMode.start();
+}
+
+//--------------------------------------------------------------
+void ofApp::leaveDrawingMode() {
+    drawingMode.stop(); // encodes whatever was drawn
+
+    const std::string encoded = drawingMode.getEncodedNaplps();
+    if (encoded.empty()) {
+        ofLogNotice("PiNaplpsPlayer") << "left drawing mode with nothing drawn";
+        bFboDirty = true;
+        return;
+    }
+
+    // Show it on the NAPLPS canvas, then share it. This is the round trip the
+    // whole app exists for: hands to vectors to every other client.
+    showNap(encoded, "(live drawing)");
+    napSource = "drawing";
+
+    client.publish(encoded, "drawing");
+    drawingMode.clearEncodedNaplps();
+}
+
+//--------------------------------------------------------------
+void ofApp::startSlideshow() {
+    if (drawingMode.isActive() || slideshowActive) return;
+    slideshowActive = true;
+    loadRandomNap();
+}
+
+//--------------------------------------------------------------
+void ofApp::stopSlideshow() {
+    slideshowActive = false;
+}
+
+//--------------------------------------------------------------
+void ofApp::publishCurrent() {
+    if (pendingNapRaw.empty()) {
+        ofLogNotice("PiNaplpsPlayer") << "nothing on screen to publish";
+        return;
+    }
+    client.publish(pendingNapRaw, "client");
+    ofLogNotice("PiNaplpsPlayer") << "published " << pendingNapRaw.size() << " bytes";
+}
+
+//--------------------------------------------------------------
+void ofApp::mintCurrent() {
+    if (pendingNapRaw.empty()) {
+        ofLogNotice("PiNaplpsPlayer") << "nothing on screen to mint";
+        return;
+    }
+
+    // The browser signs with a Beacon wallet. There is no Beacon for C++, so
+    // this asks the server to sign with its own key; it answers with a clear
+    // error when TEZOS_SECRET_KEY isn't configured there.
+    client.mintAsync(pendingNapRaw);
+    showInfo = true; // so the result is visible when it lands
+    updateInfoText();
 }

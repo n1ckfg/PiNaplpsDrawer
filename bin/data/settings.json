@@ -6,6 +6,6 @@
 
     "slideshow_interval": 10,
 
-    "_slideshow_to_rpi": "The browser client mirrors slideshow frames to the Pi. If this app IS that Pi, turning this on would feed drawings back to itself.",
+    "_slideshow_to_rpi": "If this app IS that Pi, turning this on would feed drawings back to itself.",
     "slideshow_to_rpi": false
 }
