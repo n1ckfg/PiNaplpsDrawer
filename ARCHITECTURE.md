@@ -58,10 +58,7 @@ app this was before the port. `nap-xtz-server` opens a websocket *to* this app
 and pushes drawings as its own canvas draws them; that is the Pinopticon "Pi"
 role, and it still works. Both directions are live together.
 
-Note the asymmetry this creates: the browser's slideshow mirrors every frame it
-plays to the Pi via `sendToRpi()`. If this app *is* that Pi, doing the same
-would feed drawings straight back to itself — so `slideshow_to_rpi` is off
-unless it is deliberately turned on in `bin/data/settings.json`.
+
 
 ## Live drawing
 
@@ -127,8 +124,8 @@ down by the remainder, matching the convention the browser's SVG importer uses.
 `tezos.js` signs with a Beacon wallet in the browser. There is no Beacon for
 C++, so this app has no wallet and no keys. `m` instead asks the server to mint
 with its own key via `POST /api/tezos/mint`, which answers with a clear error
-when `TEZOS_SECRET_KEY` is not configured there. Everything else about the chain
-— contract addresses, TzKT, Michelson — stays where it already was, on the
+when `TEZOS_SECRET_KEY` is not configured there. Everything else about the chain — except reading it, which this app now polls
+TzKT for directly in a background thread — stays where it already was, on the
 server.
 
 ## Rendering
@@ -146,14 +143,13 @@ still running or something marks it dirty.
 
 ### The canvas geometry
 
-`ofApp::updateLayout()` reproduces three separate things the browser does, and
-they have to agree or every drawing comes out distorted:
+`ofApp::updateLayout()` originally reproduced the browser's dynamic scaling, but now uses fixed dimensions from `settings.xml` (`fbo_width` and `fbo_height`):
 
 | Browser | Here |
 | --- | --- |
-| `scaleFactor = min(windowWidth/640, windowHeight/480)` | same, from `ofGetWidth()`/`ofGetHeight()` |
+| `scaleFactor = min(windowWidth/640, windowHeight/480)` | None (fixed `fboWidth` / `fboHeight`) |
 | `createCanvas(640*sf, 480*sf)`, centred by `#main-canvas` CSS | `canvasSize`, `canvasOffset` |
-| `scale(sf); translate(0, sH - sW)` | `drawSize = canvasSize.x`, `drawOffset.y = canvasSize.y - canvasSize.x` |
+| `scale(sf); translate(0, sH - sW)` | `drawSize = fboWidth`, `drawOffset.y = fboHeight - fboWidth` |
 
 The artwork is rendered into a **square** as wide as the canvas and then pushed
 up by the quarter that overhangs it, so what shows is the bottom three quarters
@@ -161,16 +157,14 @@ of that square. That is the same convention `convertToNaplps()` encodes to and
 the browser's SVG importer writes (`y/sH*0.75 + 0.25`); a drawing round-trips
 through hands, encoder and canvas at the size it was made.
 
-The FBO is allocated at the canvas size and blitted 1:1. It is reallocated on
-resize, along with the placeholder font.
+The FBO is allocated at `fboWidth` x `fboHeight`.
 
 ### The empty state
 
 With nothing loaded the canvas is black with `\\ DRAG ' n ' DROP //` across the
 middle, in Telidon-Bold at the browser's 36px scaled to the window — the same
 placeholder `index.html`'s `draw()` shows when `telidon` is empty. It is what is
-on screen at startup while the chain read is out, after `x` (the browser's
-"clear" link), and on entering live drawing.
+on screen at startup while the chain read is out, and on entering live drawing.
 
 ## Keys
 
@@ -178,29 +172,28 @@ on screen at startup while the chain read is out, after `x` (the browser's
 | --- | --- | --- |
 | `d` | enter/leave live drawing | Live Drawing button |
 | `s` | slideshow | "slideshow" link |
-| `n` | publish the current drawing to every client | — |
+| `c` | canvas: publish drawing to every client; drawing mode: switch camera | — |
 | `m` | mint the current drawing (server-side signing) | Mint to Tezos |
-| `c` | canvas: load the latest drawing from the chain; drawing mode: switch camera | "latest" link |
-| `x` | clear the canvas | "clear" link |
 | arrows | next/previous sample file | — |
 | `space` | redraw | — |
 | `p` / `l` | progressive draw / label points | — |
 | `i` | info overlay | — |
 | `f` | fullscreen | — |
 
-Both chain reads — the one at startup and the one on `c` — run on a detached
-thread (`NapClient::fetchLatestAsync`) and arrive through the same queue a
-broadcast drawing does, so the window keeps drawing while the request is out.
-The browser's `preload()` does the same thing with a promise. If the startup
-read fails, this falls back to the first local sample, where the browser would
-leave its placeholder standing; a player on a wall with no reachable server
-should still have something to show.
+The Tezos chain read runs on a background thread that polls TzKT directly. During
+slideshow mode, the player alternates between local files and chain drawings.
+
+Additionally, the app uses a **Dead Man's Switch**: when the network goes quiet
+for `slideTimeout` ms, the app automatically falls back to local `.nap` files
+and shuffles them. The first network drawing to arrive takes the screen back.
+A player on a wall with no reachable server or network activity will still
+have something to show.
 
 In drawing mode: `WASD` moves, `alt`+drag orbits, `alt`+`shift`+drag pans,
 wheel zooms; the mouse draws with the left button and opens the palette with the
 right, for working without a camera. `c` there swaps the Pi's ribbon camera for a
 USB webcam and back — a different key from the canvas's `c`, because the camera
-only exists in this mode and the chain read only exists in the other.
+only exists in this mode and the publish action only exists in the other.
 
 `VideoSource::switchTo()` is what makes that safe. It closes the old source
 first, since a CSI pipe and a webcam can both be holding the same sensor, and
@@ -246,9 +239,11 @@ the only way to see why a hand isn't being picked up.
 
 ## Configuration
 
-`bin/data/settings.json`, read at startup: `server_host`, `server_ws_port`
-(4321), `server_http_port` (8080), `slideshow_interval`, `slideshow_to_rpi`.
-Defaults apply when the file is absent.
+Configuration is read at startup from two files in `bin/data/`:
+* `settings.json`: `server_host`, `server_ws_port` (4321), `server_http_port` (8080).
+* `settings.xml`: `slide_timeout`, `slide_interval`, `fbo_width`, `fbo_height`, `debug_view`, `shader_name`, `tezos_contract`, `tzkt_base`, `tezos_poll_seconds`, `tezos_max_bytes`.
+
+Defaults apply when a file or setting is absent.
 
 ## Addons
 
